@@ -16,11 +16,11 @@ Running jobs are not interrupted when concurrency is reduced.
 
 ## Install
 
-Requires **Linux** and **Rust 1.85+**. Build tools must support FIFO jobservers:
+Requires **Linux** and **Rust 1.88+**. Build tools must support FIFO jobservers:
 Cargo, GNU Make **4.4+**, or Ninja **1.13+**.
 
 ```sh
-cargo install --git https://github.com/fanyang89/make-pace.git --locked
+cargo install --git https://github.com/fanyang89/make-pace.git --tag v0.1.0 --locked
 ```
 
 Ensure `~/.cargo/bin` (or your configured Cargo binary directory) is on `PATH`.
