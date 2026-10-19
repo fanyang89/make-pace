@@ -1,3 +1,4 @@
+use procfs_core::{FromBufRead, ProcessCGroups, process::MountInfos};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -45,38 +46,36 @@ fn unescape(s: &str) -> String {
 }
 
 // Walk only ancestors visible within this controller's mount.
-fn groups(memberships: &str, mounts: &str) -> Vec<Group> {
+fn groups(memberships: &str, mounts: &str) -> io::Result<Vec<Group>> {
+    let memberships =
+        ProcessCGroups::from_buf_read(memberships.as_bytes()).map_err(io::Error::other)?;
+    let mounts = MountInfos::from_buf_read(mounts.as_bytes()).map_err(io::Error::other)?;
     let mut result = Vec::new();
-    for line in mounts.lines() {
-        let Some((left, right)) = line.split_once(" - ") else {
-            continue;
-        };
-        let a: Vec<_> = left.split_whitespace().collect();
-        let b: Vec<_> = right.split_whitespace().collect();
-        if a.len() < 5 || b.len() < 3 || !matches!(b[0], "cgroup" | "cgroup2") {
+    for entry in mounts.0 {
+        if !matches!(entry.fs_type.as_str(), "cgroup" | "cgroup2") {
             continue;
         }
-        let v2 = b[0] == "cgroup2";
-        let options: Vec<_> = b[2].split(',').collect();
-        let cpu = v2 || options.contains(&"cpu");
-        let memory = v2 || options.contains(&"memory");
-        if !cpu && !memory && !options.contains(&"cpuset") && !options.contains(&"cpuacct") {
+        let v2 = entry.fs_type == "cgroup2";
+        let options = &entry.super_options;
+        let cpu = v2 || options.contains_key("cpu");
+        let memory = v2 || options.contains_key("memory");
+        if !cpu && !memory && !options.contains_key("cpuset") && !options.contains_key("cpuacct") {
             continue;
         }
-        for entry in memberships.lines() {
-            let parts: Vec<_> = entry.splitn(3, ':').collect();
-            if parts.len() != 3 {
-                continue;
-            }
-            let controllers: Vec<_> = parts[1].split(',').collect();
-            if !(v2 && parts[1].is_empty()
-                || !v2 && controllers.iter().any(|c| options.contains(c)))
+        for membership in &memberships {
+            if !(v2 && membership.controllers.is_empty()
+                || !v2
+                    && membership
+                        .controllers
+                        .iter()
+                        .any(|c| options.contains_key(c)))
             {
                 continue;
             }
-            let root = PathBuf::from(unescape(a[3]));
-            let mount = PathBuf::from(unescape(a[4]));
-            let member = PathBuf::from(parts[2]);
+            // procfs-core preserves mountinfo's octal path escapes.
+            let root = PathBuf::from(unescape(&entry.root));
+            let mount = PathBuf::from(unescape(&entry.mount_point.to_string_lossy()));
+            let member = PathBuf::from(&membership.pathname);
             let relative = member.strip_prefix(&root).ok().or_else(|| {
                 // A cgroup namespace can expose membership relative to its root.
                 (member == Path::new("/")).then_some(Path::new(""))
@@ -102,7 +101,7 @@ fn groups(memberships: &str, mounts: &str) -> Vec<Group> {
             }
         }
     }
-    result
+    Ok(result)
 }
 
 fn cpuset_count(s: &str) -> Option<usize> {
@@ -172,7 +171,7 @@ pub fn sample() -> io::Result<Snapshot> {
     };
     let memberships = fs::read_to_string("/proc/self/cgroup")?;
     let mounts = fs::read_to_string("/proc/self/mountinfo")?;
-    for g in groups(&memberships, &mounts) {
+    for g in groups(&memberships, &mounts)? {
         apply_group(&mut s, &g);
     }
     Ok(s)
@@ -251,7 +250,8 @@ mod tests {
         let g = groups(
             "0::/tenant/build\n",
             "1 0 0:1 /tenant /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
-        );
+        )
+        .unwrap();
         assert_eq!(g.len(), 2);
         assert_eq!(g[0].path, Path::new("/sys/fs/cgroup/build"));
         assert_eq!(g[1].path, Path::new("/sys/fs/cgroup"));
@@ -261,7 +261,7 @@ mod tests {
         let g = groups(
             "2:cpu,cpuacct:/a\n3:memory:/a\n",
             "1 0 0:1 / /cg/cpu rw - cgroup cgroup rw,cpu,cpuacct\n2 0 0:2 / /cg/mem rw - cgroup cgroup rw,memory\n",
-        );
+        ).unwrap();
         assert_eq!(g.len(), 4);
         assert!(g[0].cpu && !g[0].memory);
         assert!(g[2].memory && !g[2].cpu);
@@ -271,9 +271,39 @@ mod tests {
         let g = groups(
             "0::/\n",
             "1 0 0:1 /tenant /cg\\040root rw - cgroup2 cgroup rw\n",
-        );
+        )
+        .unwrap();
         assert_eq!(g[0].path, Path::new("/cg root"));
     }
+    #[test]
+    fn hybrid_hierarchies() {
+        let g = groups(
+            "0::/build\n2:cpu,cpuacct:/build\n3:memory:/build\n",
+            "1 0 0:1 / /cg/v2 rw - cgroup2 cgroup rw\n\
+             2 0 0:2 / /cg/cpu rw - cgroup cgroup rw,cpu,cpuacct\n\
+             3 0 0:3 / /cg/memory rw - cgroup cgroup rw,memory\n",
+        )
+        .unwrap();
+        assert_eq!(g.len(), 6);
+        assert!(g[0].v2 && g[0].cpu && g[0].memory);
+        assert!(!g[2].v2 && g[2].cpu && !g[2].memory);
+        assert!(!g[4].v2 && !g[4].cpu && g[4].memory);
+        assert_eq!(g[4].path, Path::new("/cg/memory/build"));
+    }
+
+    #[test]
+    fn malformed_discovery_is_an_error() {
+        let mount = "1 0 0:1 / /cg rw - cgroup2 cgroup rw\n";
+        assert!(groups("invalid\n", mount).is_err());
+        assert!(groups("0::/\n", "invalid\n").is_err());
+    }
+
+    #[test]
+    fn membership_cannot_escape_mount() {
+        let g = groups("0::/../outside\n", "1 0 0:1 / /cg rw - cgroup2 cgroup rw\n").unwrap();
+        assert!(g.is_empty());
+    }
+
     #[test]
     fn live_sample() {
         let s = sample().unwrap();
