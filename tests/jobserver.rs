@@ -65,7 +65,7 @@ fn main() {
         let mut client = OpenOptions::new()
             .read(true)
             .write(true)
-            .custom_flags(libc::O_NONBLOCK)
+            .custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits())
             .open(&path)
             .unwrap();
         let mut token = [0];
@@ -85,5 +85,22 @@ fn main() {
         drop(server);
         assert!(!dir.exists());
     }
+    // Error paths must also release the directory created by tempfile.
+    let base = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join("tmp"))
+        .join("pi");
+    fs::create_dir_all(&base).unwrap();
+    let temporary = tempfile::tempdir_in(base).unwrap();
+    use std::os::unix::ffi::OsStringExt;
+    let invalid = temporary
+        .path()
+        .join(std::ffi::OsString::from_vec(b"invalid-\xff".to_vec()));
+    // SAFETY: this executable never starts threads.
+    unsafe { std::env::set_var("TMPDIR", &invalid) };
+    // SAFETY: this executable never starts threads.
+    assert!(unsafe { jobserver::Jobserver::new() }.is_err());
+    assert_eq!(fs::read_dir(invalid.join("pi")).unwrap().count(), 0);
+    assert_eq!(std::env::var("CARGO_MAKEFLAGS").unwrap(), "sentinel flags");
     println!("PASS FIFO tokens, inheritance, environment restoration and cleanup");
 }

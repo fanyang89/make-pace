@@ -1,4 +1,7 @@
-use procfs_core::{FromBufRead, ProcessCGroups, process::MountInfos};
+use procfs::{
+    Current, CurrentSI, FromBufRead, KernelStats, Meminfo, ProcessCGroups, parse_pressure_record,
+    process::{MountInfos, Process},
+};
 use std::{
     fs, io,
     path::{Path, PathBuf},
@@ -122,47 +125,45 @@ fn quota(s: &str) -> Option<f64> {
 }
 fn pressure(text: &str) -> f64 {
     text.lines()
-        .filter(|s| s.starts_with("some "))
-        .flat_map(str::split_whitespace)
-        .find_map(|s| s.strip_prefix("avg10=")?.parse().ok())
+        .find(|line| line.starts_with("some "))
+        .and_then(|line| parse_pressure_record(line).ok())
+        .map(|record| f64::from(record.avg10))
         .unwrap_or(0.0)
 }
 
 pub fn sample() -> io::Result<Snapshot> {
-    let mem = fs::read_to_string("/proc/meminfo")?;
-    let total =
-        field(&mem, "MemTotal:").ok_or_else(|| io::Error::other("missing MemTotal"))? * 1024;
-    let available = field(&mem, "MemAvailable:")
-        .ok_or_else(|| io::Error::other("missing MemAvailable"))?
-        * 1024;
-    let stat = fs::read_to_string("/proc/stat")?;
-    let times: Vec<u64> = stat
-        .lines()
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .skip(1)
-        .take(8)
-        .filter_map(|s| s.parse().ok())
-        .collect();
-    if times.len() < 5 {
-        return Err(io::Error::other("invalid /proc/stat"));
-    }
-    let cpu_total = times.iter().sum::<u64>();
-    let status = fs::read_to_string("/proc/self/status")?;
+    let mem = Meminfo::current().map_err(io::Error::other)?;
+    let available = mem
+        .mem_available
+        .ok_or_else(|| io::Error::other("missing MemAvailable"))?;
+    let stat = KernelStats::current().map_err(io::Error::other)?;
+    let cpu = &stat.total;
+    // Guest times are already included in user/nice, so do not count them twice.
+    let cpu_busy = cpu.user
+        + cpu.nice
+        + cpu.system
+        + cpu.irq.unwrap_or(0)
+        + cpu.softirq.unwrap_or(0)
+        + cpu.steal.unwrap_or(0);
+    let cpu_total = cpu_busy + cpu.idle + cpu.iowait.unwrap_or(0);
+    let process = Process::myself().map_err(io::Error::other)?;
+    let status = process.status().map_err(io::Error::other)?;
     let affinity = status
-        .lines()
-        .find_map(|s| s.strip_prefix("Cpus_allowed_list:").and_then(cpuset_count))
-        .ok_or_else(|| io::Error::other("missing CPU affinity"))?;
+        .cpus_allowed_list
+        .ok_or_else(|| io::Error::other("missing CPU affinity"))?
+        .iter()
+        .map(|&(lo, hi)| u64::from(hi) - u64::from(lo) + 1)
+        .sum::<u64>();
     let online = read("/sys/devices/system/cpu/online")
         .and_then(|s| cpuset_count(&s))
+        .map(|n| n as u64)
         .unwrap_or(affinity);
     let mut s = Snapshot {
         cpus: affinity.min(online) as f64,
         available,
-        memory_limit: total,
+        memory_limit: mem.mem_total,
         cpu_total,
-        cpu_busy: cpu_total - times[3] - times[4],
+        cpu_busy,
         group_cpu_us: None,
         throttled: 0,
         pressure: read("/proc/pressure/memory")
@@ -237,6 +238,16 @@ fn apply_group(s: &mut Snapshot, g: &Group) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parses_pressure_with_crate() {
+        let text = "some avg10=1.25 avg60=0.50 avg300=0.10 total=1234\n\
+                    full avg10=0.25 avg60=0.10 avg300=0.00 total=100\n";
+        assert_eq!(pressure(text), 1.25);
+        assert_eq!(pressure(""), 0.0);
+        assert_eq!(pressure("some avg10=invalid"), 0.0);
+        assert_eq!(pressure("full avg10=2.0 avg60=0.0 avg300=0.0 total=1"), 0.0);
+    }
+
     #[test]
     fn parses_limits() {
         assert_eq!(cpuset_count("0-3,8,10-11\n"), Some(7));
@@ -315,10 +326,10 @@ mod tests {
         let base = std::env::var_os("TMPDIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join("tmp"));
-        let dir = base
-            .join("pi")
-            .join(format!("resource-fixture-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let base = base.join("pi");
+        fs::create_dir_all(&base).unwrap();
+        let temporary = tempfile::tempdir_in(base).unwrap();
+        let dir = temporary.path().to_path_buf();
         let leaf = dir.join("leaf");
         fs::create_dir_all(&leaf).unwrap();
         let mut s = Snapshot {
@@ -390,6 +401,5 @@ mod tests {
         fs::remove_file(dir.join("memory.usage_in_bytes")).unwrap();
         apply_group(&mut s, &group);
         assert_eq!(s.available, 0);
-        fs::remove_dir_all(dir).unwrap();
     }
 }

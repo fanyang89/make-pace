@@ -1,15 +1,16 @@
+use nix::{sys::stat::Mode, unistd::mkfifo};
 use std::{
-    ffi::CString,
     fs, io,
-    os::unix::ffi::OsStrExt,
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::PathBuf,
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
 };
+use tempfile::TempDir;
 
 pub struct Jobserver {
-    dir: PathBuf,
     client: ::jobserver::Client,
+    // Keep the FIFO alive until after the client has closed its descriptors.
+    _dir: TempDir,
     pub issued: usize,
 }
 impl Jobserver {
@@ -29,13 +30,8 @@ impl Jobserver {
             })
             .join("pi");
         fs::create_dir_all(&base)?;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(io::Error::other)?
-            .as_nanos();
-        let dir = base.join(format!("resource-jobserver-{}-{nonce}", std::process::id()));
         // MAKEFLAGS cannot safely represent arbitrary whitespace in FIFO auth paths.
-        if dir
+        if base
             .as_os_str()
             .as_bytes()
             .iter()
@@ -43,44 +39,35 @@ impl Jobserver {
         {
             return Err(io::Error::other("TMPDIR must not contain whitespace"));
         }
-        use std::os::unix::fs::DirBuilderExt;
-        fs::DirBuilder::new().mode(0o700).create(&dir)?;
-        let result = (|| {
-            let path = CString::new(dir.join("tokens").as_os_str().as_bytes())?;
-            // SAFETY: path is a valid NUL-terminated string, mode is a valid permission mask.
-            if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
-                return Err(io::Error::last_os_error());
+        let dir = tempfile::Builder::new()
+            .prefix("make-pace-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(base)?;
+        let fifo_path = dir.path().join("tokens");
+        let fifo_path = fifo_path
+            .to_str()
+            .ok_or_else(|| io::Error::other("jobserver FIFO path must be valid UTF-8"))?;
+        mkfifo(fifo_path, Mode::S_IRUSR | Mode::S_IWUSR)?;
+        let previous = std::env::var_os("CARGO_MAKEFLAGS");
+        // SAFETY: the caller guarantees single-threaded startup. The auth value
+        // names our FIFO, so from_env_ext never takes ownership of inherited FDs.
+        let result = unsafe {
+            std::env::set_var(
+                "CARGO_MAKEFLAGS",
+                format!("--jobserver-auth=fifo:{fifo_path}"),
+            );
+            let result = ::jobserver::Client::from_env_ext(true).client;
+            match previous {
+                Some(value) => std::env::set_var("CARGO_MAKEFLAGS", value),
+                None => std::env::remove_var("CARGO_MAKEFLAGS"),
             }
-            let fifo_path = dir.join("tokens");
-            let fifo_path = fifo_path
-                .to_str()
-                .ok_or_else(|| io::Error::other("jobserver FIFO path must be valid UTF-8"))?;
-            let previous = std::env::var_os("CARGO_MAKEFLAGS");
-            // SAFETY: the caller guarantees single-threaded startup. The auth value
-            // names our FIFO, so from_env_ext never takes ownership of inherited FDs.
-            let result = unsafe {
-                std::env::set_var(
-                    "CARGO_MAKEFLAGS",
-                    format!("--jobserver-auth=fifo:{fifo_path}"),
-                );
-                let result = ::jobserver::Client::from_env_ext(true).client;
-                match previous {
-                    Some(value) => std::env::set_var("CARGO_MAKEFLAGS", value),
-                    None => std::env::remove_var("CARGO_MAKEFLAGS"),
-                }
-                result
-            };
-            let client = result.map_err(io::Error::other)?;
-            Ok(Self {
-                dir: dir.clone(),
-                client,
-                issued: 0,
-            })
-        })();
-        if result.is_err() {
-            let _ = fs::remove_dir_all(&dir);
-        }
-        result
+            result
+        };
+        Ok(Self {
+            client: result.map_err(io::Error::other)?,
+            _dir: dir,
+            issued: 0,
+        })
     }
     pub fn configure(&self, cmd: &mut Command) {
         self.client.configure_make(cmd);
@@ -122,10 +109,5 @@ impl Jobserver {
             }
         }
         Ok(())
-    }
-}
-impl Drop for Jobserver {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
     }
 }

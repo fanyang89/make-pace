@@ -7,9 +7,10 @@ license = "MIT"
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 jobserver = "0.1.35"
-libc = "0.2"
-procfs-core = { version = "0.18.0", default-features = false }
+nix = { version = "0.31.3", features = ["fs", "signal"] }
+procfs = { version = "0.18.0", default-features = false }
 signal-hook = "0.4.5"
+tempfile = "3.27.0"
 
 [[test]]
 name = "jobserver"

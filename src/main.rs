@@ -6,6 +6,10 @@ mod jobserver;
 mod resources;
 
 use clap::Parser;
+use nix::{
+    sys::signal::{Signal, killpg},
+    unistd::Pid,
+};
 use signal_hook::{
     consts::{SIGHUP, SIGINT, SIGTERM},
     iterator::Signals,
@@ -116,11 +120,9 @@ fn inherited() -> Option<OsString> {
             s.contains("--jobserver-auth=") || s.contains("--jobserver-fds=")
         })
 }
-fn send_group(pid: u32, signal: i32) {
-    // SAFETY: the child was placed in a new process group with this ID.
-    unsafe {
-        libc::kill(-(pid as i32), signal);
-    }
+fn send_group(pid: u32, signal: Signal) {
+    // The child was placed in a process group with this ID; it may have exited.
+    let _ = killpg(Pid::from_raw(pid as i32), signal);
 }
 fn run(args: Vec<OsString>) -> io::Result<ExitStatus> {
     let needs_fifo = validate(&args)?;
@@ -190,7 +192,7 @@ fn run(args: Vec<OsString>) -> io::Result<ExitStatus> {
             Ok(Some(status)) => {
                 // The build leader has exited; remaining descendants must not retain
                 // a jobserver whose backing directory is about to be removed.
-                send_group(pid, libc::SIGKILL);
+                send_group(pid, Signal::SIGKILL);
                 if let Some(error) = failure {
                     return Err(error);
                 }
@@ -198,17 +200,17 @@ fn run(args: Vec<OsString>) -> io::Result<ExitStatus> {
             }
             Ok(None) => (),
             Err(error) => {
-                send_group(pid, libc::SIGKILL);
+                send_group(pid, Signal::SIGKILL);
                 let _ = child.wait();
                 return Err(error);
             }
         }
         for signal in signals.pending() {
-            send_group(pid, signal);
+            send_group(pid, Signal::try_from(signal).expect("registered signal"));
             shutdown.get_or_insert(Instant::now());
         }
         if shutdown.is_some_and(|t: Instant| t.elapsed() >= Duration::from_secs(5)) {
-            send_group(pid, libc::SIGKILL);
+            send_group(pid, Signal::SIGKILL);
         }
         if shutdown.is_none()
             && let (Some(j), Some(c)) = (&mut server, &mut controller)
@@ -229,7 +231,7 @@ fn run(args: Vec<OsString>) -> io::Result<ExitStatus> {
             })();
             if let Err(error) = result {
                 failure = Some(error);
-                send_group(pid, libc::SIGTERM);
+                send_group(pid, Signal::SIGTERM);
                 shutdown = Some(Instant::now());
             }
         }
