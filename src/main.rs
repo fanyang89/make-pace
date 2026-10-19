@@ -1,5 +1,5 @@
 #[cfg(not(target_os = "linux"))]
-compile_error!("my-resources-controller currently supports Linux only");
+compile_error!("make-pace currently supports Linux only");
 mod control;
 mod jobserver;
 mod resources;
@@ -152,7 +152,7 @@ fn run(args: Vec<OsString>) -> io::Result<ExitStatus> {
             cmd.env(key, &flags);
         }
         eprintln!(
-            "resource-controller: inherited jobserver; preserving parent policy (adaptive control disabled)"
+            "make-pace: inherited jobserver; preserving parent policy (adaptive control disabled)"
         );
         server = None;
         controller = None;
@@ -169,7 +169,7 @@ fn run(args: Vec<OsString>) -> io::Result<ExitStatus> {
         }
         let initial = resources::sample()?;
         eprintln!(
-            "resource-controller: CPU {:.2}, memory limit {:.2} GiB, available {:.2} GiB",
+            "make-pace: CPU {:.2}, memory limit {:.2} GiB, available {:.2} GiB",
             initial.cpus,
             initial.memory_limit as f64 / (1u64 << 30) as f64,
             initial.available as f64 / (1u64 << 30) as f64
@@ -232,7 +232,7 @@ fn run(args: Vec<OsString>) -> io::Result<ExitStatus> {
                     last_sample = Instant::now();
                     let next = c.update(now, elapsed);
                     if next != target {
-                        eprintln!("resource-controller: jobs {target} -> {next}");
+                        eprintln!("make-pace: jobs {target} -> {next}");
                         target = next;
                     }
                 }
@@ -255,7 +255,7 @@ fn main() {
     }
     if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
         println!(
-            "Usage: my-resources-controller -- <cargo|make|ninja|cmake --build> [args...]\n\nAutomatically detects Linux host/cgroup v1/v2 resources and adapts FIFO jobserver concurrency.\nRequires Make >= 4.4 / Ninja >= 1.13. Do not pass explicit parallelism options."
+            "Usage: make-pace -- <cargo|make|ninja|cmake --build> [args...]\n\nAutomatically detects Linux host/cgroup v1/v2 resources and adapts FIFO jobserver concurrency.\nRequires Make >= 4.4 / Ninja >= 1.13. Do not pass explicit parallelism options."
         );
         return;
     }
@@ -266,7 +266,7 @@ fn main() {
                 .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
         ),
         Err(error) => {
-            eprintln!("resource-controller: {error}");
+            eprintln!("make-pace: {error}");
             std::process::exit(1);
         }
     }

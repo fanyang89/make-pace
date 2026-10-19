@@ -8,7 +8,7 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-BIN = ROOT / 'target/debug/my-resources-controller'
+BIN = ROOT / 'target/debug/make-pace'
 env = dict(os.environ)
 for key in ('MAKEFLAGS', 'MFLAGS', 'CARGO_MAKEFLAGS', 'CARGO_BUILD_JOBS', 'CMAKE_BUILD_PARALLEL_LEVEL'):
     env.pop(key, None)
