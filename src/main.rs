@@ -176,7 +176,9 @@ fn run(args: Vec<OsString>) -> io::Result<ExitStatus> {
             initial.memory_limit as f64 / (1u64 << 30) as f64,
             initial.available as f64 / (1u64 << 30) as f64
         );
-        let j = jobserver::Jobserver::new()?;
+        // SAFETY: this binary has not started any threads; initialization happens
+        // before spawning the build. No dependency here starts background threads.
+        let j = unsafe { jobserver::Jobserver::new()? };
         j.configure(&mut cmd);
         // configure supplies authoritative jobserver flags; append non-jobserver flags.
         if !old.is_empty() {

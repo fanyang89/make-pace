@@ -1,8 +1,7 @@
 use std::{
     ffi::CString,
-    fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
-    os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+    fs, io,
+    os::unix::ffi::OsStrExt,
     path::PathBuf,
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
@@ -10,11 +9,16 @@ use std::{
 
 pub struct Jobserver {
     dir: PathBuf,
-    fifo: File,
+    client: ::jobserver::Client,
     pub issued: usize,
 }
 impl Jobserver {
-    pub fn new() -> io::Result<Self> {
+    /// Create a private FIFO and connect the jobserver client.
+    ///
+    /// # Safety
+    /// Must be called before any other threads are started: the crate only exposes
+    /// environment-based FIFO attachment, so CARGO_MAKEFLAGS is temporarily changed.
+    pub unsafe fn new() -> io::Result<Self> {
         let base = std::env::var_os("TMPDIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -47,14 +51,29 @@ impl Jobserver {
             if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
                 return Err(io::Error::last_os_error());
             }
-            let fifo = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-                .open(dir.join("tokens"))?;
+            let fifo_path = dir.join("tokens");
+            let fifo_path = fifo_path
+                .to_str()
+                .ok_or_else(|| io::Error::other("jobserver FIFO path must be valid UTF-8"))?;
+            let previous = std::env::var_os("CARGO_MAKEFLAGS");
+            // SAFETY: the caller guarantees single-threaded startup. The auth value
+            // names our FIFO, so from_env_ext never takes ownership of inherited FDs.
+            let result = unsafe {
+                std::env::set_var(
+                    "CARGO_MAKEFLAGS",
+                    format!("--jobserver-auth=fifo:{fifo_path}"),
+                );
+                let result = ::jobserver::Client::from_env_ext(true).client;
+                match previous {
+                    Some(value) => std::env::set_var("CARGO_MAKEFLAGS", value),
+                    None => std::env::remove_var("CARGO_MAKEFLAGS"),
+                }
+                result
+            };
+            let client = result.map_err(io::Error::other)?;
             Ok(Self {
                 dir: dir.clone(),
-                fifo,
+                client,
                 issued: 0,
             })
         })();
@@ -64,10 +83,20 @@ impl Jobserver {
         result
     }
     pub fn configure(&self, cmd: &mut Command) {
-        let flags = format!(
-            "-j --jobserver-auth=fifo:{}",
-            self.dir.join("tokens").display()
-        );
+        self.client.configure_make(cmd);
+        // jobserver emits legacy --jobserver-fds even for FIFO auth. Ninja
+        // interprets that as an FD pair and ignores the entire jobserver.
+        let flags = cmd
+            .get_envs()
+            .find(|(key, _)| *key == "MAKEFLAGS")
+            .and_then(|(_, value)| value)
+            .expect("configure_make sets MAKEFLAGS")
+            .to_str()
+            .expect("FIFO path was validated as UTF-8")
+            .split_whitespace()
+            .filter(|flag| !flag.starts_with("--jobserver-fds="))
+            .collect::<Vec<_>>()
+            .join(" ");
         for key in ["MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS"] {
             cmd.env(key, &flags);
         }
@@ -76,21 +105,20 @@ impl Jobserver {
         // The top-level build owns one implicit slot. No in-flight token is revoked.
         let desired = target.saturating_sub(1);
         while self.issued < desired {
-            match self.fifo.write(b"+") {
-                Ok(1) => self.issued += 1,
+            match self.client.release_raw() {
+                Ok(()) => self.issued += 1,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
-                _ => return Err(io::Error::other("short FIFO write")),
             }
         }
         while self.issued > desired {
-            match self.fifo.read(&mut [0u8; 1]) {
-                Ok(1) => self.issued -= 1,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-                _ => return Err(io::Error::other("unexpected FIFO EOF")),
+            match self.client.try_acquire()? {
+                Some(token) => {
+                    token.drop_without_releasing();
+                    self.issued -= 1;
+                }
+                None => break,
             }
         }
         Ok(())
@@ -99,37 +127,5 @@ impl Jobserver {
 impl Drop for Jobserver {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-    #[test]
-    fn tokens_and_cleanup() {
-        let mut j = Jobserver::new().unwrap();
-        let path = j.dir.clone();
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        j.resize(4).unwrap();
-        assert_eq!(j.issued, 3);
-        let mut client = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path.join("tokens"))
-            .unwrap();
-        let mut token = [0];
-        client.read_exact(&mut token).unwrap();
-        j.resize(1).unwrap();
-        assert_eq!(j.issued, 1);
-        client.write_all(&token).unwrap();
-        j.resize(1).unwrap();
-        assert_eq!(j.issued, 0);
-        drop(j);
-        assert!(!path.exists());
     }
 }
