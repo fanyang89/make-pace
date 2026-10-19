@@ -17,8 +17,8 @@ base = Path(env.get('TMPDIR', str(Path.home() / 'tmp'))) / 'pi'
 base.mkdir(parents=True, exist_ok=True)
 
 
-def run(args, cwd, code=0):
-    result = subprocess.run([str(BIN), '--', *args], cwd=cwd, env=env,
+def run(args, cwd, code=0, wrapper_args=()):
+    result = subprocess.run([str(BIN), *wrapper_args, '--', *args], cwd=cwd, env=env,
                             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
     assert result.returncode == code, result.stdout + result.stderr
     assert 'jobserver unavailable' not in result.stderr.lower(), result.stderr
@@ -29,6 +29,17 @@ def run(args, cwd, code=0):
 
 with tempfile.TemporaryDirectory(prefix='resource-tests-', dir=base) as temporary:
     root = Path(temporary)
+    explain_tmp = root / 'unused-tmp'
+    result = subprocess.run(
+        [str(BIN), '--max-jobs', '1', '--ramp-interval', '2s', '--explain'],
+        cwd=root, env=dict(env, TMPDIR=str(explain_tmp)),
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert 'Job slot ceiling: 1' in result.stdout, result.stdout
+    assert 'Ramp interval: 2s' in result.stdout, result.stdout
+    assert not explain_tmp.exists(), 'explain must not create a FIFO'
+    print('PASS explain without build or FIFO')
     makefile = root / 'Makefile'
     makefile.write_text('.PHONY: all ' + ' '.join(f't{i}' for i in range(12)) + '\n'
                         + 'all: ' + ' '.join(f't{i}' for i in range(12)) + '\n'
@@ -37,6 +48,7 @@ with tempfile.TemporaryDirectory(prefix='resource-tests-', dir=base) as temporar
                         + 'long:\n\t@sleep 60\n'
                         + 'nested:\n\t+$(MAKE) all\n')
     run(['make'], root)
+    run(['make'], root, wrapper_args=['--max-jobs', '1', '--ramp-interval', '2s'])
     run(['make', 'nested'], root)
     run(['make', 'fail'], root, 2)
     run(['make', '-j4'], root, 1)
@@ -47,6 +59,19 @@ with tempfile.TemporaryDirectory(prefix='resource-tests-', dir=base) as temporar
     assert result.returncode == 0, result.stderr
     assert 'inherited jobserver' in result.stderr, result.stderr
     print('PASS inherited parent jobserver')
+    for index, option in enumerate(('--max-jobs 2', '--ramp-interval 2s')):
+        makefile.write_text(makefile.read_text() + f'policy_parent{index}:\n\t+{BIN} {option} -- make all\n')
+        result = subprocess.run(['make', '-j2', f'policy_parent{index}'], cwd=root, env=env,
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode != 0, result.stdout
+        assert 'cannot override an inherited jobserver' in result.stderr, result.stderr
+    makefile.write_text(makefile.read_text() + f'explain_parent:\n\t+{BIN} --explain\n')
+    result = subprocess.run(['make', '-j2', 'explain_parent'], cwd=root, env=env,
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert 'adaptive control disabled' in result.stdout, result.stdout
+    assert 'Job slot ceiling:' not in result.stdout, result.stdout
+    print('PASS inherited policy conflicts and explain')
     makefile.write_text(makefile.read_text() +
         f"cargo_parent:\n\t+env -u MAKEFLAGS -u MFLAGS CARGO_MAKEFLAGS='$(MAKEFLAGS)' {BIN} -- make all\n")
     result = subprocess.run(['make', '-j2', 'cargo_parent'], cwd=root, env=env,

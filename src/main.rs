@@ -124,14 +124,56 @@ fn send_group(pid: u32, signal: Signal) {
     // The child was placed in a process group with this ID; it may have exited.
     let _ = killpg(Pid::from_raw(pid as i32), signal);
 }
-fn run(args: Vec<OsString>) -> io::Result<ExitStatus> {
+fn run(cli: cli::Cli) -> io::Result<Option<ExitStatus>> {
+    let inherited = inherited();
+    if inherited.is_some() && (cli.max_jobs.is_some() || cli.ramp_interval.is_some()) {
+        return Err(io::Error::other(
+            "--max-jobs and --ramp-interval cannot override an inherited jobserver",
+        ));
+    }
+    let policy = cli.policy();
+    if cli.explain {
+        let snapshot = resources::sample()?;
+        println!("Effective CPU capacity: {:.2}", snapshot.cpus);
+        println!(
+            "Memory limit: {:.2} GiB",
+            snapshot.memory_limit as f64 / (1u64 << 30) as f64
+        );
+        println!(
+            "Available memory: {:.2} GiB",
+            snapshot.available as f64 / (1u64 << 30) as f64
+        );
+        if inherited.is_some() {
+            println!(
+                "Mode: inherited jobserver (adaptive control disabled; parent owns the limits)"
+            );
+        } else {
+            println!("Mode: adaptive FIFO jobserver");
+            println!("Initial job slots: 1 (implicit slot)");
+            println!(
+                "Job slot ceiling: {} (CPU-derived bound, capped at {})",
+                policy.ceiling(snapshot.cpus),
+                policy.max_jobs
+            );
+            println!(
+                "Ramp interval: {} of healthy samples (+1 slot, sampled every second)",
+                humantime::format_duration(policy.ramp_interval)
+            );
+            println!("Pressure reduces concurrency; running jobs are not interrupted.");
+        }
+        println!(
+            "Only visible host/cgroup constraints are detected; this is not a hard resource cap."
+        );
+        return Ok(None);
+    }
+    let args = cli.command;
     let needs_fifo = validate(&args)?;
     let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
     let mut cmd = Command::new(&args[0]);
     cmd.args(&args[1..]).process_group(0);
     let mut server;
     let mut controller;
-    if let Some(flags) = inherited() {
+    if let Some(flags) = inherited {
         if needs_fifo && !flags.to_string_lossy().contains("--jobserver-auth=fifo:") {
             return Err(io::Error::other(
                 "Ninja requires an inherited FIFO jobserver; anonymous-pipe jobservers are unsupported",
@@ -179,7 +221,7 @@ fn run(args: Vec<OsString>) -> io::Result<ExitStatus> {
             cmd.env("MAKEFLAGS", format!("{old} {flags}"));
         }
         server = Some(j);
-        controller = Some(control::Controller::new(initial));
+        controller = Some(control::Controller::new(initial, policy));
     }
     let mut child = cmd.spawn()?;
     let pid = child.id();
@@ -196,7 +238,7 @@ fn run(args: Vec<OsString>) -> io::Result<ExitStatus> {
                 if let Some(error) = failure {
                     return Err(error);
                 }
-                return Ok(status);
+                return Ok(Some(status));
             }
             Ok(None) => (),
             Err(error) => {
@@ -240,8 +282,9 @@ fn run(args: Vec<OsString>) -> io::Result<ExitStatus> {
 }
 fn main() {
     let cli = cli::Cli::parse();
-    match run(cli.command) {
-        Ok(status) => std::process::exit(
+    match run(cli) {
+        Ok(None) => (),
+        Ok(Some(status)) => std::process::exit(
             status
                 .code()
                 .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),

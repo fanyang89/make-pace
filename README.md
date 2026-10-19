@@ -49,6 +49,28 @@ Do not set `-j`, `--jobs`, `--parallel`, `CARGO_BUILD_JOBS`, or
 `CMAKE_BUILD_PARALLEL_LEVEL`; make-pace manages concurrency for you. An inherited
 jobserver is preserved, with adaptive control disabled.
 
+## Concurrency controls
+
+```sh
+# Inspect resources and policy without starting a build.
+make-pace --explain
+
+# Cap concurrency and add at most one slot per 2 seconds of healthy samples.
+make-pace --max-jobs 6 --ramp-interval 2s -- cargo build --release
+```
+
+- `--max-jobs`: upper bound of 1–4096 slots, including the implicit slot.
+  The automatic CPU-derived ceiling and memory pressure may keep concurrency lower.
+- `--ramp-interval`: continuous healthy time before adding one slot (default `3s`).
+  Sampling occurs every second; shorter intervals cannot increase that frequency.
+  Unhealthy samples reset progress, and idle time does not accumulate burst credit.
+  This limits concurrency growth, **not task starts per second**.
+- `--explain`: reports current visible resources and policy; accepts no build command.
+
+Place wrapper options before the build command. Explicit concurrency controls are
+rejected when a parent jobserver is inherited. Shrinking concurrency waits for
+returned tokens rather than interrupting running jobs.
+
 ## License
 
 [MIT](LICENSE)
