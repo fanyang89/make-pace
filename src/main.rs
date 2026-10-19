@@ -1,9 +1,11 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("make-pace currently supports Linux only");
+mod cli;
 mod control;
 mod jobserver;
 mod resources;
 
+use clap::Parser;
 use std::{
     env,
     ffi::OsString,
@@ -249,17 +251,8 @@ fn run(args: Vec<OsString>) -> io::Result<ExitStatus> {
     }
 }
 fn main() {
-    let mut args: Vec<_> = env::args_os().skip(1).collect();
-    if args.first().is_some_and(|a| a == "--") {
-        args.remove(0);
-    }
-    if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
-        println!(
-            "Usage: make-pace -- <cargo|make|ninja|cmake --build> [args...]\n\nAutomatically detects Linux host/cgroup v1/v2 resources and adapts FIFO jobserver concurrency.\nRequires Make >= 4.4 / Ninja >= 1.13. Do not pass explicit parallelism options."
-        );
-        return;
-    }
-    match run(args) {
+    let cli = cli::Cli::parse();
+    match run(cli.command) {
         Ok(status) => std::process::exit(
             status
                 .code()
