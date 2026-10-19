@@ -6,6 +6,10 @@ mod jobserver;
 mod resources;
 
 use clap::Parser;
+use signal_hook::{
+    consts::{SIGHUP, SIGINT, SIGTERM},
+    iterator::Signals,
+};
 use std::{
     env,
     ffi::OsString,
@@ -13,27 +17,8 @@ use std::{
     os::unix::process::{CommandExt, ExitStatusExt},
     path::Path,
     process::{Command, ExitStatus},
-    sync::atomic::{AtomicI32, Ordering},
     time::{Duration, Instant},
 };
-static SIGNAL: AtomicI32 = AtomicI32::new(0);
-extern "C" fn signal_handler(signal: libc::c_int) {
-    SIGNAL.store(signal, Ordering::Relaxed);
-}
-fn install_signals() -> io::Result<()> {
-    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-        // SAFETY: zero initializes sigaction; handler only writes a lock-free atomic.
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = signal_handler as *const () as usize;
-            libc::sigemptyset(&mut action.sa_mask);
-            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-    }
-    Ok(())
-}
 fn version_at_least(program: &str, required: (u32, u32)) -> io::Result<()> {
     let out = Command::new(program).arg("--version").output()?;
     let text = String::from_utf8_lossy(&out.stdout);
@@ -139,7 +124,7 @@ fn send_group(pid: u32, signal: i32) {
 }
 fn run(args: Vec<OsString>) -> io::Result<ExitStatus> {
     let needs_fifo = validate(&args)?;
-    install_signals()?;
+    let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
     let mut cmd = Command::new(&args[0]);
     cmd.args(&args[1..]).process_group(0);
     let mut server;
@@ -218,8 +203,7 @@ fn run(args: Vec<OsString>) -> io::Result<ExitStatus> {
                 return Err(error);
             }
         }
-        let signal = SIGNAL.swap(0, Ordering::Relaxed);
-        if signal != 0 {
+        for signal in signals.pending() {
             send_group(pid, signal);
             shutdown.get_or_insert(Instant::now());
         }

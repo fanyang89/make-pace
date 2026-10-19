@@ -9,6 +9,7 @@ clap = { version = "4.6.7", features = ["derive"] }
 jobserver = "0.1.35"
 libc = "0.2"
 procfs-core = { version = "0.18.0", default-features = false }
+signal-hook = "0.4.5"
 
 [[test]]
 name = "jobserver"

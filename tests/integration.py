@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -79,10 +80,61 @@ with tempfile.TemporaryDirectory(prefix='resource-tests-', dir=base) as temporar
         '.env("MAKEFLAGS", flags).status().unwrap().success());\n}\n')
     run(['cargo', 'build', '--offline'], root)
 
-    proc = subprocess.Popen([str(BIN), '--', 'make', 'long'], cwd=root, env=env,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-    time.sleep(0.5)
-    proc.send_signal(signal.SIGTERM)
-    _, stderr = proc.communicate(timeout=10)
-    assert proc.returncode != 0, stderr
-    print('PASS signal forwarding')
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        proc = subprocess.Popen([str(BIN), '--', 'make', 'long'], cwd=root, env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            time.sleep(0.5)
+            proc.send_signal(sig)
+            _, stderr = proc.communicate(timeout=10)
+            assert proc.returncode != 0, stderr
+            print('PASS signal forwarding', sig.name)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    # A controlled Cargo stand-in verifies exact signals and the kill deadline.
+    fake_bin = root / 'fake-bin'
+    fake_bin.mkdir()
+    fake_cargo = fake_bin / 'cargo'
+    fake_cargo.write_text(f'#!{sys.executable}\n'
+        'import os, signal, sys, time\n'
+        'from pathlib import Path\n'
+        'def handle(sig, frame):\n'
+        '    sys.exit(128 + sig)\n'
+        'for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):\n'
+        '    signal.signal(sig, signal.SIG_IGN if sys.argv[1] == "ignore" else handle)\n'
+        'Path("ready").write_text(str(os.getpid()))\n'
+        'while True: time.sleep(1)\n')
+    fake_cargo.chmod(0o700)
+    fake_env = dict(env, PATH=str(fake_bin) + os.pathsep + env.get('PATH', ''))
+    for mode, sig in [('handle', signal.SIGINT), ('handle', signal.SIGTERM),
+                      ('handle', signal.SIGHUP), ('ignore', signal.SIGTERM)]:
+        ready = root / 'ready'
+        ready.unlink(missing_ok=True)
+        proc = subprocess.Popen([str(BIN), '--', 'cargo', mode], cwd=root, env=fake_env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 10
+            while not ready.exists():
+                assert proc.poll() is None, 'wrapper exited before child was ready'
+                assert time.monotonic() < deadline, 'child readiness timeout'
+                time.sleep(0.02)
+            started = time.monotonic()
+            proc.send_signal(sig)
+            _, stderr = proc.communicate(timeout=10)
+            expected = 128 + (signal.SIGKILL if mode == 'ignore' else sig)
+            assert proc.returncode == expected, (proc.returncode, stderr)
+            if mode == 'ignore':
+                assert time.monotonic() - started >= 5, 'kill deadline fired early'
+            print('PASS signal exit status', mode, sig.name)
+        finally:
+            if ready.exists():
+                try:
+                    os.killpg(int(ready.read_text()), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
