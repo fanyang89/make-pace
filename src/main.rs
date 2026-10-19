@@ -1,0 +1,273 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!("my-resources-controller currently supports Linux only");
+mod control;
+mod jobserver;
+mod resources;
+
+use std::{
+    env,
+    ffi::OsString,
+    io,
+    os::unix::process::{CommandExt, ExitStatusExt},
+    path::Path,
+    process::{Command, ExitStatus},
+    sync::atomic::{AtomicI32, Ordering},
+    time::{Duration, Instant},
+};
+static SIGNAL: AtomicI32 = AtomicI32::new(0);
+extern "C" fn signal_handler(signal: libc::c_int) {
+    SIGNAL.store(signal, Ordering::Relaxed);
+}
+fn install_signals() -> io::Result<()> {
+    for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        // SAFETY: zero initializes sigaction; handler only writes a lock-free atomic.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = signal_handler as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(signal, &action, std::ptr::null_mut()) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+fn version_at_least(program: &str, required: (u32, u32)) -> io::Result<()> {
+    let out = Command::new(program).arg("--version").output()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let version = text.split_whitespace().find_map(|word| {
+        let mut parts = word.split('.');
+        Some((
+            parts.next()?.parse::<u32>().ok()?,
+            parts.next()?.parse::<u32>().ok()?,
+        ))
+    });
+    if !out.status.success() || !version.is_some_and(|v| v >= required) {
+        return Err(io::Error::other(format!(
+            "{program} >= {}.{} is required for FIFO jobserver support",
+            required.0, required.1
+        )));
+    }
+    Ok(())
+}
+fn validate(args: &[OsString]) -> io::Result<bool> {
+    let mut needs_fifo = false;
+    for arg in &args[1..] {
+        let s = arg.to_string_lossy();
+        if (s.starts_with('-') && !s.starts_with("--") && s.contains('j'))
+            || s == "--jobs"
+            || s.starts_with("--jobs=")
+            || s == "--parallel"
+            || s.starts_with("--parallel=")
+        {
+            return Err(io::Error::other(
+                "explicit parallelism overrides the jobserver; remove -j/--jobs/--parallel",
+            ));
+        }
+    }
+    for key in ["CMAKE_BUILD_PARALLEL_LEVEL", "CARGO_BUILD_JOBS"] {
+        if env::var_os(key).is_some() {
+            return Err(io::Error::other(format!(
+                "unset {key}; parallelism is managed by the jobserver"
+            )));
+        }
+    }
+    let name = Path::new(&args[0])
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    match name {
+        "cargo" => (),
+        "make" | "gmake" => version_at_least(args[0].to_str().unwrap(), (4, 4))?,
+        "ninja" => {
+            needs_fifo = true;
+            version_at_least(args[0].to_str().unwrap(), (1, 13))?;
+        }
+        "cmake" => {
+            let index = args.iter().position(|a| a == "--build").ok_or_else(|| {
+                io::Error::other("use cmake --build <directory>; configure separately")
+            })?;
+            let dir = args
+                .get(index + 1)
+                .ok_or_else(|| io::Error::other("missing cmake build directory"))?;
+            let cache = std::fs::read_to_string(Path::new(dir).join("CMakeCache.txt"))?;
+            let generator = cache
+                .lines()
+                .find_map(|s| s.strip_prefix("CMAKE_GENERATOR:INTERNAL="))
+                .unwrap_or("");
+            let program = cache
+                .lines()
+                .find_map(|s| s.strip_prefix("CMAKE_MAKE_PROGRAM:FILEPATH="))
+                .ok_or_else(|| io::Error::other("missing CMAKE_MAKE_PROGRAM"))?;
+            match generator {
+                "Ninja" | "Ninja Multi-Config" => {
+                    needs_fifo = true;
+                    version_at_least(program, (1, 13))?;
+                }
+                "Unix Makefiles" => version_at_least(program, (4, 4))?,
+                _ => {
+                    return Err(io::Error::other(format!(
+                        "unsupported CMake generator: {generator}"
+                    )));
+                }
+            }
+        }
+        _ => {
+            return Err(io::Error::other(
+                "supported commands: cargo, make, ninja, cmake --build",
+            ));
+        }
+    }
+    Ok(needs_fifo)
+}
+fn inherited() -> Option<OsString> {
+    ["CARGO_MAKEFLAGS", "MAKEFLAGS"]
+        .iter()
+        .filter_map(env::var_os)
+        .find(|s| {
+            let s = s.to_string_lossy();
+            s.contains("--jobserver-auth=") || s.contains("--jobserver-fds=")
+        })
+}
+fn send_group(pid: u32, signal: i32) {
+    // SAFETY: the child was placed in a new process group with this ID.
+    unsafe {
+        libc::kill(-(pid as i32), signal);
+    }
+}
+fn run(args: Vec<OsString>) -> io::Result<ExitStatus> {
+    let needs_fifo = validate(&args)?;
+    install_signals()?;
+    let mut cmd = Command::new(&args[0]);
+    cmd.args(&args[1..]).process_group(0);
+    let mut server;
+    let mut controller;
+    if let Some(flags) = inherited() {
+        if needs_fifo && !flags.to_string_lossy().contains("--jobserver-auth=fifo:") {
+            return Err(io::Error::other(
+                "Ninja requires an inherited FIFO jobserver; anonymous-pipe jobservers are unsupported",
+            ));
+        }
+        for key in ["MAKEFLAGS", "CARGO_MAKEFLAGS", "MFLAGS"] {
+            cmd.env(key, &flags);
+        }
+        eprintln!(
+            "resource-controller: inherited jobserver; preserving parent policy (adaptive control disabled)"
+        );
+        server = None;
+        controller = None;
+    } else {
+        // Preserve ordinary make options, but reject ambiguous pre-existing parallelism.
+        let old = env::var("MAKEFLAGS").unwrap_or_default();
+        if old
+            .split_whitespace()
+            .any(|s| s.starts_with("-j") || s.starts_with("--jobs"))
+        {
+            return Err(io::Error::other(
+                "remove parallelism options from MAKEFLAGS",
+            ));
+        }
+        let initial = resources::sample()?;
+        eprintln!(
+            "resource-controller: CPU {:.2}, memory limit {:.2} GiB, available {:.2} GiB",
+            initial.cpus,
+            initial.memory_limit as f64 / (1u64 << 30) as f64,
+            initial.available as f64 / (1u64 << 30) as f64
+        );
+        let j = jobserver::Jobserver::new()?;
+        j.configure(&mut cmd);
+        // configure supplies authoritative jobserver flags; append non-jobserver flags.
+        if !old.is_empty() {
+            let flags = cmd
+                .get_envs()
+                .find(|(k, _)| *k == "MAKEFLAGS")
+                .and_then(|(_, v)| v)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            cmd.env("MAKEFLAGS", format!("{old} {flags}"));
+        }
+        server = Some(j);
+        controller = Some(control::Controller::new(initial));
+    }
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    let mut last_sample = Instant::now();
+    let mut shutdown = None;
+    let mut failure = None;
+    let mut target = 1;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // The build leader has exited; remaining descendants must not retain
+                // a jobserver whose backing directory is about to be removed.
+                send_group(pid, libc::SIGKILL);
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+                return Ok(status);
+            }
+            Ok(None) => (),
+            Err(error) => {
+                send_group(pid, libc::SIGKILL);
+                let _ = child.wait();
+                return Err(error);
+            }
+        }
+        let signal = SIGNAL.swap(0, Ordering::Relaxed);
+        if signal != 0 {
+            send_group(pid, signal);
+            shutdown.get_or_insert(Instant::now());
+        }
+        if shutdown.is_some_and(|t: Instant| t.elapsed() >= Duration::from_secs(5)) {
+            send_group(pid, libc::SIGKILL);
+        }
+        if shutdown.is_none()
+            && let (Some(j), Some(c)) = (&mut server, &mut controller)
+        {
+            let result = (|| {
+                if last_sample.elapsed() >= Duration::from_secs(1) {
+                    let now = resources::sample()?;
+                    let elapsed = last_sample.elapsed();
+                    last_sample = Instant::now();
+                    let next = c.update(now, elapsed);
+                    if next != target {
+                        eprintln!("resource-controller: jobs {target} -> {next}");
+                        target = next;
+                    }
+                }
+                // Retry pending contraction more often than resource sampling.
+                j.resize(target)
+            })();
+            if let Err(error) = result {
+                failure = Some(error);
+                send_group(pid, libc::SIGTERM);
+                shutdown = Some(Instant::now());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+fn main() {
+    let mut args: Vec<_> = env::args_os().skip(1).collect();
+    if args.first().is_some_and(|a| a == "--") {
+        args.remove(0);
+    }
+    if args.is_empty() || args[0] == "--help" || args[0] == "-h" {
+        println!(
+            "Usage: my-resources-controller -- <cargo|make|ninja|cmake --build> [args...]\n\nAutomatically detects Linux host/cgroup v1/v2 resources and adapts FIFO jobserver concurrency.\nRequires Make >= 4.4 / Ninja >= 1.13. Do not pass explicit parallelism options."
+        );
+        return;
+    }
+    match run(args) {
+        Ok(status) => std::process::exit(
+            status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
+        ),
+        Err(error) => {
+            eprintln!("resource-controller: {error}");
+            std::process::exit(1);
+        }
+    }
+}
