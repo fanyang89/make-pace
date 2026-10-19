@@ -4,14 +4,24 @@ An experimental Linux resource-aware build wrapper. It detects host and visible
 cgroup v1/v2 constraints and adjusts a GNU-compatible FIFO jobserver while a build
 runs. No CPU or memory budget needs to be supplied.
 
+## Installation
+
+Requires Linux and Rust 1.85 or newer (edition 2024).
+
+```sh
+cargo install --git https://github.com/fanyang89/make-pace.git --locked
+```
+
+Ensure Cargo's binary directory (`~/.cargo/bin` by default) is on your `PATH`.
+To install from a local checkout, run `cargo install --path . --locked` instead.
+
 ## Usage
 
 ```sh
-cargo build --release
-./target/release/make-pace -- cargo build --release
-./target/release/make-pace -- make
+make-pace -- cargo build --release
+make-pace -- make
 cmake -S . -B build -G Ninja
-./target/release/make-pace -- cmake --build build
+make-pace -- cmake --build build
 ```
 
 Requires Linux, Cargo with FIFO jobserver support, GNU Make **4.4+**, or Ninja
